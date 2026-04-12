@@ -181,7 +181,7 @@ Mooncake 初始化链路可以概括为：
 
 ![alt text](image.png)
 
-## P端传输调用链路
+## P端传输流程
 
 P 端的主路径是先在 Prefill 阶段拆分并整理 KV chunk，再由 MooncakeKVManager 统一入队，最后在 transfer_worker 中调用底层传输引擎完成批量 RDMA 发送。
 
