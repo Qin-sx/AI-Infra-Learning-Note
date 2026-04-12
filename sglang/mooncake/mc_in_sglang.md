@@ -261,8 +261,6 @@ Mooncake 的 Python 接口可以按同步/异步、单条/批量来理解。
 | `batch_transfer_sync` | `TransferEnginePy::batchTransferSync` | 通用批量同步传输 | 通过 `opcode` 区分读写 |
 | `batch_transfer_sync_write` | `TransferEnginePy::batchTransferSyncWrite` | KV 发送、写回 | 批量写入远端地址 |
 | `batch_transfer_sync_read` | `TransferEnginePy::batchTransferSyncRead` | 模型加载、读取 | 批量从远端读取数据 |
-| `batch_transfer_async_write` | `TransferEnginePy::batchTransferAsyncWrite` | 异步写入 | 返回 batch id，后续轮询状态 |
-| `batch_transfer_async_read` | `TransferEnginePy::batchTransferAsyncRead` | 异步读取 | 返回 batch id，后续轮询状态 |
 
 ## `batch_transfer_sync` 后续调用链
 
