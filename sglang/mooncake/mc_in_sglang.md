@@ -262,29 +262,87 @@ Mooncake 的 Python 接口可以按同步/异步、单条/批量来理解。
 | `batch_transfer_sync_write` | `TransferEnginePy::batchTransferSyncWrite` | KV 发送、写回 | 批量写入远端地址 |
 | `batch_transfer_sync_read` | `TransferEnginePy::batchTransferSyncRead` | 模型加载、读取 | 批量从远端读取数据 |
 
-## `batch_transfer_sync` 后续调用链
+## `batch_transfer_sync` 调用链
 
-这里描述的是 `batch_transfer_sync` 进入 Mooncake 之后的内部调用流程。
+### 1. `TransferEnginePy::batchTransferSync()`
+
+这里描述的是 `batch_transfer_sync` 进入 Mooncake 之后，在 Python 绑定层和 `TransferEnginePy` 这一层的内部调用流程。
 
 ```text
 Python API: batch_transfer_sync
     -> TransferEnginePy::batchTransferSync()
     -> engine_->allocateBatchID()
-    -> engine_->submitTransfer() / engine_->submitTransferWithNotify()
+    -> TransferEngine::submitTransfer() / TransferEngine::submitTransferWithNotify()
+    -> TransferEngineImpl::submitTransfer() / TransferEngineImpl::submitTransferWithNotify()
     -> engine_->getBatchTransferStatus()  (循环轮询直到 COMPLETED/FAILED/TIMEOUT)
     -> engine_->freeBatchID()
 ```
 
-其中，状态判定发生在 `getBatchTransferStatus()`，资源回收发生在 `freeBatchID()`。
+这里可以理解为：`batchTransferSync()` 负责参数校验、构建 `TransferRequest` 列表、申请 batch id、提交 batch，并在本层同步轮询状态直到结束。它本身不做协议分发，真正的协议分发发生在下一层 `MultiTransport::submitTransfer()`。
+
+其中，状态判定发生在 `getBatchTransferStatus()`，资源回收发生在 `freeBatchID()`。如果调用的是 `batch_transfer_sync` 的 notify 版本，提交数据后还会在 batch 完成时通过 `getBatchTransferStatus()` 触发通知发送；notify 只是附加动作，不会改变底层数据提交路径。
+
+这一层可以按下面的步骤理解：
 
 | 步骤 | 函数名 | 文件位置 | 主要操作 |
 | --- | --- | --- | --- |
 | 1 | `batch_transfer_sync` | Python API | 用户调用入口，接收目标主机、缓冲区列表等参数 |
 | 2 | `batchTransferSync` | `mooncake-integration/transfer_engine/transfer_engine_py.cpp` | 获取或创建段句柄，校验输入参数，构建 `TransferRequest` 列表 |
 | 3 | `allocateBatchID` | `mooncake-integration/transfer_engine/transfer_engine_py.cpp` | 分配 Batch ID 用于跟踪本次传输 |
-| 4 | `submitTransfer` / `submitTransferWithNotify` | `mooncake-integration/transfer_engine/transfer_engine_py.cpp` | 提交传输任务到传输引擎 |
+| 4 | `submitTransfer` / `submitTransferWithNotify` | `mooncake-integration/transfer_engine/transfer_engine_py.cpp` | 通过 `TransferEngine` / `TransferEngineImpl` 提交传输任务 |
 | 5 | `getBatchTransferStatus` | `mooncake-integration/transfer_engine/transfer_engine_py.cpp` | 轮询传输状态直到完成、失败或超时 |
 | 6 | `freeBatchID` | `mooncake-integration/transfer_engine/transfer_engine_py.cpp` | 释放 Batch ID 和相关资源 |
+
+### 2. `MultiTransport::submitTransfer()`
+
+`MultiTransport::submitTransfer()` 的直接调用位置在 `TransferEngineImpl` 中：
+
+- `TransferEngineImpl::submitTransfer()` 会直接调用 `multi_transports_->submitTransfer(batch_id, entries)`。
+- `TransferEngineImpl::submitTransferWithNotify()` 也会先调用 `multi_transports_->submitTransfer(batch_id, entries)`，成功后再记录 notify。
+
+`MultiTransport::submitTransfer()` 的核心逻辑如下，这里就是多态分发真正发生的地方：它先根据每条请求的目标 segment 选择对应的 `Transport`，再把同一类 transport 的任务聚合起来，最后调用各自的 `submitTransferTask()`。
+
+```cpp
+Status MultiTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries) {
+    auto &batch_desc = *((BatchDesc *)(batch_id));
+    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+        return Status::TooManyRequests(
+            "Exceed the limitation of batch capacity");
+    }
+
+    size_t task_id = batch_desc.task_list.size();
+    batch_desc.task_list.resize(task_id + entries.size());
+
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+        submit_tasks;
+    for (auto &request : entries) {
+        Transport *transport = nullptr;
+        auto status = selectTransport(request, transport);
+        if (!status.ok()) return status;
+        assert(transport);
+        auto &task = batch_desc.task_list[task_id];
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<Transport::TransferRequest *>(&request);
+#else
+        task.request = &request;
+#endif
+        ++task_id;
+        submit_tasks[transport].push_back(&task);
+    }
+    Status overall_status = Status::OK();
+    for (auto &entry : submit_tasks) {
+        auto status = entry.first->submitTransferTask(entry.second);
+        if (!status.ok()) {
+            overall_status = status;
+        }
+    }
+    return overall_status;
+}
+```
+
+这里可以把它理解成“提交阶段的分发器”：`selectTransport()` 负责根据目标 segment 的协议挑选实现，`submitTransferTask()` 则是每个具体 transport 真正执行提交的入口。`RdmaTransport`、`NvlinkTransport`、`TcpTransport` 等实现都在这里接上，因此你前面问的多态，确实主要就是在这一层发生的。
 
 ## RDMA 分支与 NVLink 分支举例
 
@@ -294,6 +352,7 @@ RDMA 分支示例：
 
 ```text
 TransferEngine::submitTransfer()
+    -> TransferEngineImpl::submitTransfer()
     -> MultiTransport::submitTransfer()
     -> RdmaTransport::submitTransfer()
     -> RdmaTransport::submitTransferTask()
@@ -306,6 +365,7 @@ NVLink 分支示例：
 
 ```text
 TransferEngine::submitTransfer()
+    -> TransferEngineImpl::submitTransfer()
     -> MultiTransport::submitTransfer()
     -> NvlinkTransport::submitTransfer()
     -> 构造并处理 Slice
