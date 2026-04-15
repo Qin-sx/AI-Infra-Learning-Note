@@ -1,3 +1,17 @@
+# 概括
+
+## Mooncake的初始化
+
+Mooncake 的初始化是在进程内全局创建并复用一个共享 `TransferEngine`（单例），供多个模块统一使用，避免重复初始化传输资源。
+
+## Mooncake的调用
+
+Mooncake 的调用流程是由 P 端执行 `batch_transfer_sync` 完成数据发送，发送结果再由 P 端通过 ZMQ 状态同步消息（`bootstrap_room, status, prefill_rank`）通知 D 端收敛状态。
+
+## Mooncake的数据传输
+
+Mooncake 的数据传输是上层通过 batchTransferSync 统一提交传输请求，底层按协议分发到对应传输实现并最终落到 RDMA verbs（如 ibv_post_send）或 CUDA 拷贝接口（如 cudaMemcpy/cudaMemcpyAsync）完成数据搬运。
+
 # **Mooncake的初始化**
 
 ## **传输引擎初始化流程**
